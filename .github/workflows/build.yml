@@ -1,0 +1,105 @@
+name: Build lvgl_micropython for ESP32-S3 (release + robust artifacts)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # allow creating a Release
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kdschlosser fork + submodules
+        uses: actions/checkout@v4
+        with:
+          repository: lvgl-micropython/lvgl_micropython
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip python3-venv cmake ninja-build \
+            flex bison gperf ccache libffi-dev libssl-dev dfu-util wget curl xz-utils gawk \
+            build-essential libncurses-dev libusb-1.0-0 unzip
+
+      - name: Install ESP-IDF v5.4 locally
+        run: |
+          git clone -b v5.4 --recursive https://github.com/espressif/esp-idf.git $GITHUB_WORKSPACE/esp-idf
+          $GITHUB_WORKSPACE/esp-idf/install.sh esp32,esp32s3
+
+      - name: Fix IDF 5.4 venv deps (pin click < 8.2)
+        shell: bash
+        run: |
+          set -eux
+          VENV="$HOME/.espressif/python_env/idf5.4_py3.10_env"
+          "$VENV/bin/python" -m pip install --upgrade "pip<24.3"
+          "$VENV/bin/python" -m pip install --force-reinstall "click<8.2,>=7.0"
+
+      - name: Export ESP-IDF env + verify
+        shell: bash
+        run: |
+          set -eux
+          source "$GITHUB_WORKSPACE/esp-idf/export.sh"
+          idf.py --version
+          which python3
+
+      - name: Build MicroPython (ESP32_GENERIC_S3)
+        shell: bash
+        run: |
+          set -eux
+          source "$GITHUB_WORKSPACE/esp-idf/export.sh"
+          make -C lib/micropython/ports/esp32 BOARD=ESP32_GENERIC_S3 submodules
+          make -C lib/micropython/ports/esp32 BOARD=ESP32_GENERIC_S3 -j$(nproc)
+          find lib/micropython/ports/esp32 -type f -name "firmware*.bin" -print || true
+
+      - name: Locate any firmware binaries
+        id: locate
+        shell: bash
+        run: |
+          set -eux
+          mapfile -t BINS < <(find lib/micropython/ports/esp32 -type f -name "firmware*.bin" | sort || true)
+          if [ "${#BINS[@]}" -gt 0 ]; then
+            echo "firmware=${BINS[0]}" >> "$GITHUB_OUTPUT"
+            echo "Found primary firmware: ${BINS[0]}"
+          else
+            echo "No firmware*.bin found yet"
+          fi
+
+      - name: Upload primary firmware artifact (if found)
+        if: steps.locate.outputs.firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: ${{ steps.locate.outputs.firmware }}
+
+      - name: Upload ALL .bin files (wide net)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-bins
+          path: |
+            **/firmware*.bin
+            **/*.bin
+
+      - name: Create GitHub Release (if primary firmware found)
+        if: steps.locate.outputs.firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: firmware-s3-${{ github.run_number }}
+          name: ESP32-S3 firmware ${{ github.run_number }}
+          body: Auto-built LVGL MicroPython for ESP32-S3 (ESP32_GENERIC_S3).
+          files: ${{ steps.locate.outputs.firmware }}
+
+      - name: Upload build dirs/logs (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-outputs
+          path: |
+            lib/micropython/ports/esp32/build*
+            lib/micropython/ports/esp32/flash_args
+            lib/micropython/ports/esp32/partition_table/*
+            lib/micropython/ports/esp32/bootloader/*
